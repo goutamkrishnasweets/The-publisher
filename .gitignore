@@ -1,0 +1,59 @@
+# Environment & secrets
+.env
+.env.*
+!.env.example
+Credentials/
+*.pem
+*.key
+*.token
+*.secret
+
+# User data, vaults, and runtime databases
+data/*.json
+!data/.gitkeep
+data/telegram_users.json
+data/bot_config.json
+data/telegram_sessions.json
+data/master_vault_index.json
+data/telegram_vault_index.json
+data/pool_metadata.json
+data/seo_learning.json
+
+# Downloaded and processed media
+downloads/
+Original_audio/
+*.mp4
+*.mp3
+*.wav
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.m4a
+*.ts
+
+# Python cache & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+
+# Caches and runtime logs
+logs/
+*.log
+storage/*.json
+!storage/.gitkeep
+.cache/
+_archive/
+
+# OS and Editor artifacts
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
