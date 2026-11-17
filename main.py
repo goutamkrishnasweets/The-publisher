@@ -380,12 +380,20 @@ from Telegram_Storage_Modules.telegram_user_manager import (
     get_user_storage_group_id,
     set_user_branding,
     set_user_instagram_token,
+    get_user_instagram_token,
     set_user_instagram_id,
+    get_user_instagram_id,
     set_user_facebook_token,
+    get_user_facebook_token,
     set_user_facebook_id,
+    get_user_facebook_id,
     set_user_meta_app,
+    get_user_meta_app_id,
+    get_user_meta_app_secret,
     set_user_youtube_client_secret,
+    get_user_youtube_client_secret,
     set_user_youtube_token,
+    get_user_youtube_token_json,
     _is_admin_user,
     is_vault_enabled,
     set_user_vault_mode,
@@ -393,6 +401,11 @@ from Telegram_Storage_Modules.telegram_user_manager import (
     set_user_seo_blueprint,
     get_user_active_channels,
     set_user_active_channels,
+)
+from Publishing_Modules.meta_uploader import (
+    build_meta_oauth_url,
+    exchange_meta_oauth_code,
+    save_and_sync_meta_credentials,
 )
 from Telegram_Storage_Modules.telegram_session_manager import session_manager
 from Telegram_Storage_Modules.telegram_http import send_document, extract_file_id, download_telegram_document
@@ -808,6 +821,325 @@ async def cmd_setbuffer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Invalid token.")
 
 
+# ── YouTube Shorts Setup Commands ─────────────────────────────────────────────
+
+async def cmd_setytclient(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sets Google OAuth client_secret JSON for YouTube Data API."""
+    uid = str(update.effective_chat.id)
+    raw_text = " ".join(context.args).strip() if context.args else ""
+    if not raw_text:
+        await update.message.reply_text(
+            "🔴 **YouTube Shorts Client Setup**\n\n"
+            "**Option A (Easiest):** Drag & drop your `client_secret.json` file directly into this chat!\n\n"
+            "**Option B (Paste JSON):**\n"
+            "`/setytclient <paste contents of client_secret.json>`\n\n"
+            "**Option C (Client ID & Secret):**\n"
+            "`/setytclient <client_id> <client_secret>`\n\n"
+            "Need credentials? Create an OAuth 2.0 Client ID (Desktop App) in Google Cloud Console:\n"
+            "👉 `https://console.cloud.google.com/apis/credentials`"
+        )
+        return
+
+    # Check if raw_text is two arguments (client_id client_secret)
+    parts = raw_text.split()
+    if len(parts) == 2 and not raw_text.startswith("{"):
+        client_dict = {
+            "installed": {
+                "client_id": parts[0].strip(),
+                "client_secret": parts[1].strip(),
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+            }
+        }
+        raw_text = json.dumps(client_dict)
+
+    ok = set_user_youtube_client_secret(uid, raw_text)
+    if ok:
+        await update.message.reply_text(
+            "✅ **YouTube Client Secret Saved!**\n\n"
+            "Next Step: Generate your channel authorization link by sending:\n"
+            "👉 `/connectyt` (or `/ytlogin`)"
+        )
+    else:
+        await update.message.reply_text("❌ Failed to save YouTube client secret. Please verify JSON format.")
+
+
+async def cmd_connectyt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generates the Google OAuth authorization URL for YouTube Shorts."""
+    import urllib.parse
+    uid = str(update.effective_chat.id)
+    secret_str = get_user_youtube_client_secret(uid) or os.getenv("CLIENT_SECRET_FILE", "")
+
+    client_id = None
+    if secret_str:
+        if os.path.isfile(secret_str):
+            try:
+                with open(secret_str, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    client_id = data.get("installed", {}).get("client_id") or data.get("web", {}).get("client_id")
+            except Exception:
+                pass
+        else:
+            try:
+                data = json.loads(secret_str)
+                client_id = data.get("installed", {}).get("client_id") or data.get("web", {}).get("client_id")
+            except Exception:
+                pass
+
+    if not client_id:
+        await update.message.reply_text(
+            "⚠️ **YouTube Client Secret Not Configured**\n\n"
+            "Please configure your client credentials first:\n"
+            "👉 Drop your `client_secret.json` into this chat, or run `/setytclient`"
+        )
+        return
+
+    scopes = "https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.force-ssl"
+    redirect_uri = "urn:ietf:wg:oauth:2.0:oob"
+    auth_url = (
+        f"https://accounts.google.com/o/oauth2/v2/auth?"
+        f"client_id={urllib.parse.quote(client_id)}&"
+        f"redirect_uri={urllib.parse.quote(redirect_uri)}&"
+        f"response_type=code&"
+        f"scope={urllib.parse.quote(scopes)}&"
+        f"access_type=offline&"
+        f"prompt=consent"
+    )
+
+    await update.message.reply_text(
+        f"🔴 **YouTube Channel Authorization**\n\n"
+        f"1. 👉 [Click Here to Authorize YouTube]({auth_url})\n\n"
+        f"2. Sign in with your YouTube account and tap **Allow**.\n"
+        f"3. Copy the authorization code shown on your screen.\n"
+        f"4. Send it back here:\n"
+        f"`/ytcode <YOUR_CODE>`",
+        parse_mode="Markdown"
+    )
+
+
+async def cmd_ytcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Exchanges Google authorization code for YouTube access & refresh token."""
+    import urllib.request
+    import urllib.parse
+    uid = str(update.effective_chat.id)
+    code = " ".join(context.args).strip() if context.args else ""
+    if not code:
+        await update.message.reply_text("Usage: `/ytcode YOUR_AUTHORIZATION_CODE`")
+        return
+
+    status_msg = await update.message.reply_text("🔄 **Exchanging code with Google API...**")
+    secret_str = get_user_youtube_client_secret(uid) or os.getenv("CLIENT_SECRET_FILE", "")
+
+    client_id = None
+    client_secret = None
+    if secret_str:
+        if os.path.isfile(secret_str):
+            try:
+                with open(secret_str, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    info = data.get("installed") or data.get("web") or {}
+                    client_id, client_secret = info.get("client_id"), info.get("client_secret")
+            except Exception:
+                pass
+        else:
+            try:
+                data = json.loads(secret_str)
+                info = data.get("installed") or data.get("web") or {}
+                client_id, client_secret = info.get("client_id"), info.get("client_secret")
+            except Exception:
+                pass
+
+    if not client_id or not client_secret:
+        await status_msg.edit_text("❌ Could not read client_id/client_secret. Please run `/setytclient` first.")
+        return
+
+    try:
+        token_url = "https://oauth2.googleapis.com/token"
+        params = urllib.parse.urlencode({
+            "code": code,
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "redirect_uri": "urn:ietf:wg:oauth:2.0:oob",
+            "grant_type": "authorization_code",
+        }).encode("utf-8")
+
+        req = urllib.request.Request(token_url, data=params, headers={"Content-Type": "application/x-www-form-urlencoded"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            token_data = json.loads(resp.read().decode("utf-8"))
+
+        token_data["client_id"] = client_id
+        token_data["client_secret"] = client_secret
+        token_json_str = json.dumps(token_data)
+
+        ok = set_user_youtube_token(uid, token_json_str)
+        if ok:
+            await status_msg.edit_text(
+                "🎉 **YouTube Shorts Connected Successfully!**\n\n"
+                "Your channel is now authorized. Approved videos will be published to YouTube Shorts.\n"
+                "Check `/myconfig` to view configuration.",
+                parse_mode="Markdown"
+            )
+        else:
+            await status_msg.edit_text("❌ Failed to save YouTube token.")
+    except Exception as e:
+        logger.error("YouTube code exchange error: %s", e)
+        await status_msg.edit_text(f"❌ YouTube authorization error: {e}")
+
+
+async def cmd_setyttoken(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Saves raw YouTube token.json directly."""
+    uid = str(update.effective_chat.id)
+    raw_text = " ".join(context.args).strip() if context.args else ""
+    if not raw_text:
+        await update.message.reply_text("Usage: `/setyttoken <paste token.json content>`\nOr upload your `token.json` file directly.")
+        return
+    ok = set_user_youtube_token(uid, raw_text)
+    if ok:
+        await update.message.reply_text("✅ **YouTube Token Saved Successfully!** Channel is active.")
+    else:
+        await update.message.reply_text("❌ Failed to save YouTube token.")
+
+
+# ── Meta (Instagram & Facebook) Setup Commands ─────────────────────────────────
+
+async def cmd_connectmeta(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """1-Click Meta (Instagram & Facebook) OAuth Setup."""
+    uid = str(update.effective_chat.id)
+    args = context.args or []
+
+    app_id = None
+    app_secret = None
+    if len(args) >= 2:
+        app_id = args[0].strip()
+        app_secret = args[1].strip()
+        set_user_meta_app(uid, app_id, app_secret)
+    else:
+        app_id = get_user_meta_app_id(uid) or os.getenv("META_APP_ID")
+        app_secret = get_user_meta_app_secret(uid) or os.getenv("META_APP_SECRET")
+
+    if not app_id or not app_secret:
+        await update.message.reply_text(
+            "📸 **Meta (Instagram & Facebook) Setup**\n\n"
+            "**Option A (1-Click OAuth Connect):**\n"
+            "Send your Meta App ID and Secret:\n"
+            "`/setmeta <APP_ID> <APP_SECRET>` (or `/connectmeta <APP_ID> <APP_SECRET>`)\n\n"
+            "**Option B (Direct Access Token):**\n"
+            "If you already have a Page or Instagram access token:\n"
+            "• `/instagramtoken <YOUR_TOKEN>`\n"
+            "• `/instagramid <YOUR_IG_BUSINESS_ID>`\n"
+            "• `/facebooktoken <YOUR_PAGE_TOKEN>`\n"
+            "• `/facebookid <YOUR_PAGE_ID>`\n\n"
+            "Need a Meta App? Create one at `https://developers.facebook.com/apps`"
+        )
+        return
+
+    redirect_uri = "https://localhost/"
+    auth_url = build_meta_oauth_url(app_id, redirect_uri)
+    await update.message.reply_text(
+        f"📸 **Meta 1-Click Authorization**\n\n"
+        f"1. 👉 [Click Here to Authorize Instagram & Facebook]({auth_url})\n\n"
+        f"2. Log in and select your Facebook Page and Instagram Business account.\n"
+        f"3. Grant all publishing permissions and tap **Done**.\n"
+        f"4. You will be redirected to a page that starts with `https://localhost/?code=...`\n"
+        f"5. Copy the entire redirected URL (or just the `code=...` part) and send:\n"
+        f"`/metacode <PASTE_REDIRECTED_URL>`",
+        parse_mode="Markdown"
+    )
+
+
+async def cmd_metacode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Exchanges Meta authorization code and automatically saves Page & Instagram tokens."""
+    uid = str(update.effective_chat.id)
+    code = " ".join(context.args).strip() if context.args else ""
+    if not code:
+        await update.message.reply_text("Usage: `/metacode <PASTE_REDIRECTED_URL_OR_CODE>`")
+        return
+
+    app_id = get_user_meta_app_id(uid) or os.getenv("META_APP_ID")
+    app_secret = get_user_meta_app_secret(uid) or os.getenv("META_APP_SECRET")
+    if not app_id or not app_secret:
+        await update.message.reply_text("⚠️ Meta App ID or Secret missing. Please run `/setmeta <APP_ID> <APP_SECRET>` first.")
+        return
+
+    status_msg = await update.message.reply_text("🔄 **Exchanging code with Meta Graph API & discovering accounts...**")
+    auth_res = exchange_meta_oauth_code(code, app_id, app_secret, redirect_uri="https://localhost/")
+    if not auth_res.get("success"):
+        err = auth_res.get("error", "Unknown error")
+        await status_msg.edit_text(f"❌ Meta authorization failed: {err}")
+        return
+
+    ok, msg = save_and_sync_meta_credentials(auth_res, uid)
+    if ok:
+        ig_set = bool(auth_res.get("ig_business_id"))
+        fb_set = bool(auth_res.get("meta_page_id"))
+        await status_msg.edit_text(
+            f"🎉 **Meta Connected Successfully!**\n\n"
+            f"📘 Facebook Page: `{'✅ Connected' if fb_set else '❌ Not Found'}`\n"
+            f"📸 Instagram Business: `{'✅ Connected' if ig_set else '❌ Not Found'}`\n\n"
+            f"Approved reels will now automatically syndicate to your Meta channels!\n"
+            f"Check `/myconfig` to view status.",
+            parse_mode="Markdown"
+        )
+    else:
+        await status_msg.edit_text(f"❌ Failed to save Meta credentials: {msg}")
+
+
+async def cmd_instagramtoken(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sets Instagram Business Access Token directly."""
+    uid = str(update.effective_chat.id)
+    tok = " ".join(context.args).strip() if context.args else ""
+    if not tok:
+        await update.message.reply_text("Usage: `/instagramtoken <YOUR_ACCESS_TOKEN>`\nAlso remember to set `/instagramid <YOUR_IG_BUSINESS_ID>`.")
+        return
+    ok = set_user_instagram_token(uid, tok)
+    if ok:
+        await update.message.reply_text("✅ **Instagram Access Token Saved!**\nNext: Set your business ID via `/instagramid <ID>`")
+    else:
+        await update.message.reply_text("❌ Failed to save Instagram token.")
+
+
+async def cmd_instagramid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sets Instagram Business Account ID directly."""
+    uid = str(update.effective_chat.id)
+    ig_id = " ".join(context.args).strip() if context.args else ""
+    if not ig_id:
+        await update.message.reply_text("Usage: `/instagramid <YOUR_IG_BUSINESS_ID>`")
+        return
+    ok = set_user_instagram_id(uid, ig_id)
+    if ok:
+        await update.message.reply_text("✅ **Instagram Business Account ID Saved!** Check `/myconfig`.")
+    else:
+        await update.message.reply_text("❌ Failed to save Instagram ID.")
+
+
+async def cmd_facebooktoken(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sets Facebook Page Access Token directly."""
+    uid = str(update.effective_chat.id)
+    tok = " ".join(context.args).strip() if context.args else ""
+    if not tok:
+        await update.message.reply_text("Usage: `/facebooktoken <YOUR_PAGE_TOKEN>`\nAlso remember to set `/facebookid <YOUR_PAGE_ID>`.")
+        return
+    ok = set_user_facebook_token(uid, tok)
+    if ok:
+        await update.message.reply_text("✅ **Facebook Page Token Saved!**\nNext: Set your page ID via `/facebookid <ID>`")
+    else:
+        await update.message.reply_text("❌ Failed to save Facebook Page token.")
+
+
+async def cmd_facebookid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sets Facebook Page ID directly."""
+    uid = str(update.effective_chat.id)
+    page_id = " ".join(context.args).strip() if context.args else ""
+    if not page_id:
+        await update.message.reply_text("Usage: `/facebookid <YOUR_PAGE_ID>`")
+        return
+    ok = set_user_facebook_id(uid, page_id)
+    if ok:
+        await update.message.reply_text("✅ **Facebook Page ID Saved!** Check `/myconfig`.")
+    else:
+        await update.message.reply_text("❌ Failed to save Facebook Page ID.")
+
+
 async def cmd_setbranding(update: Update, context: ContextTypes.DEFAULT_TYPE):
     brand = " ".join(context.args).strip() if context.args else ""
     uid = str(update.effective_chat.id)
@@ -842,10 +1174,14 @@ async def cmd_guide(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "   Send: `/setgemini <KEY>`\n\n"
         "• ⚡ **MTProto 2GB High-Speed Engine:**\n"
         "   Send: `/setmtproto <api_id> <api_hash>`\n\n"
-        "• 📸 **Meta (Instagram & Facebook Direct):**\n"
-        "   Send: `/instagramtoken <TOKEN>` and `/instagramid <ID>`\n\n"
-        "• 🔴 **YouTube Shorts Direct:**\n"
-        "   Send: `/setytclient <CLIENT_SECRET_JSON>`"
+        "• 🔴 **YouTube Shorts Setup:**\n"
+        "   1. Drop `client_secret.json` into chat (or run `/setytclient`)\n"
+        "   2. Send `/connectyt` to get your Google authorization link\n"
+        "   3. Send `/ytcode <CODE>` (or paste `/setyttoken <JSON>`)\n\n"
+        "• 📸 **Meta (Instagram & Facebook Setup):**\n"
+        "   • 1-Click OAuth: `/setmeta <APP_ID> <APP_SECRET>` then `/connectmeta`\n"
+        "   • Instagram Direct: `/instagramtoken <TOKEN>` & `/instagramid <ID>`\n"
+        "   • Facebook Direct: `/facebooktoken <TOKEN>` & `/facebookid <PAGE_ID>`"
     )
     await update.message.reply_text(guide_text)
 
@@ -1028,6 +1364,37 @@ async def handle_incoming_media(update: Update, context: ContextTypes.DEFAULT_TY
 
     chat_id = msg.chat.id
     user_id = str(chat_id)
+
+    # Auto-detect dropped JSON credential files (client_secret.json or token.json)
+    if msg.document and msg.document.file_name and msg.document.file_name.lower().endswith(".json"):
+        try:
+            doc_file = await msg.document.get_file()
+            f_bytes = await doc_file.download_as_bytearray()
+            f_text = f_bytes.decode("utf-8")
+            data = json.loads(f_text)
+
+            # Detect Google client_secret.json
+            if "installed" in data or "web" in data:
+                set_user_youtube_client_secret(user_id, f_text)
+                await msg.reply_text(
+                    "✅ **`client_secret.json` Detected & Saved!**\n\n"
+                    "Next step: Authorize your YouTube channel by sending:\n"
+                    "👉 `/connectyt` (or `/ytlogin`)",
+                    parse_mode="Markdown"
+                )
+                return
+
+            # Detect Google token.json
+            if "refresh_token" in data or ("access_token" in data and ("client_id" in data or "token_uri" in data)):
+                set_user_youtube_token(user_id, f_text)
+                await msg.reply_text(
+                    "🎉 **`token.json` Detected & Saved!**\n\n"
+                    "YouTube Shorts is now authorized and active for auto-publishing!",
+                    parse_mode="Markdown"
+                )
+                return
+        except Exception as _doc_err:
+            logger.debug("Document JSON auto-detect notice: %s", _doc_err)
 
     # 1. Detect media type (Video or Photo)
     is_photo = bool(msg.photo or (msg.document and msg.document.mime_type and msg.document.mime_type.startswith("image/")))
@@ -1386,6 +1753,28 @@ def main():
     app.add_handler(CommandHandler("buffertoken", cmd_setbuffer))
     app.add_handler(CommandHandler("setbranding", cmd_setbranding))
     app.add_handler(CommandHandler("guide", cmd_guide))
+
+    # YouTube Shorts Setup
+    app.add_handler(CommandHandler("setytclient", cmd_setytclient))
+    app.add_handler(CommandHandler("ytclient", cmd_setytclient))
+    app.add_handler(CommandHandler("connectyt", cmd_connectyt))
+    app.add_handler(CommandHandler("ytlogin", cmd_connectyt))
+    app.add_handler(CommandHandler("ytcode", cmd_ytcode))
+    app.add_handler(CommandHandler("setyttoken", cmd_setyttoken))
+    app.add_handler(CommandHandler("yttoken", cmd_setyttoken))
+
+    # Meta (Instagram & Facebook) Setup
+    app.add_handler(CommandHandler("connectmeta", cmd_connectmeta))
+    app.add_handler(CommandHandler("setmeta", cmd_connectmeta))
+    app.add_handler(CommandHandler("metacode", cmd_metacode))
+    app.add_handler(CommandHandler("instagramtoken", cmd_instagramtoken))
+    app.add_handler(CommandHandler("setigtoken", cmd_instagramtoken))
+    app.add_handler(CommandHandler("instagramid", cmd_instagramid))
+    app.add_handler(CommandHandler("setigid", cmd_instagramid))
+    app.add_handler(CommandHandler("facebooktoken", cmd_facebooktoken))
+    app.add_handler(CommandHandler("setfbtoken", cmd_facebooktoken))
+    app.add_handler(CommandHandler("facebookid", cmd_facebookid))
+    app.add_handler(CommandHandler("setfbid", cmd_facebookid))
 
     # Media and Messages (Supports Videos, Photos, and Documents)
     app.add_handler(MessageHandler(filters.VIDEO | filters.PHOTO | filters.Document.ALL, handle_incoming_media))
