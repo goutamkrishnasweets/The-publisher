@@ -683,42 +683,87 @@ async def cmd_myconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(summary, parse_mode="Markdown")
 
 
+async def cmd_storage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Alias for viewing/setting storage group."""
+    await cmd_setstorage(update, context)
+
+
 async def cmd_setstorage(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Sets user's private Telegram Storage Vault group ID in telegram_users.json and bot_config.json."""
+    """Sets or views user's private Telegram Storage Vault group ID in telegram_users.json and bot_config.json."""
     gid = " ".join(context.args).strip() if context.args else ""
     user = update.effective_user
     uid = str(user.id) if user else str(update.effective_chat.id)
 
-    # If sent from inside a group or channel, auto-detect the group ID directly!
+    # 1. If sent from inside a group or channel without args, auto-detect the group ID directly!
     if not gid and update.effective_chat.type in ("group", "supergroup", "channel"):
         gid = str(update.effective_chat.id)
 
+    # 2. Check if user forwarded a message from the storage group or channel
+    if not gid and update.message and update.message.forward_from_chat:
+        gid = str(update.message.forward_from_chat.id)
+
+    # 3. If still no ID provided, display the current status and helpful interactive instructions
     if not gid:
+        current_gid = get_user_storage_group_id(uid)
+        current_display = f"`{current_gid}`" if current_gid else "_Not configured yet_"
+        
+        # Test current connection if configured
+        status_text = ""
+        if current_gid:
+            try:
+                chat_info = await context.bot.get_chat(chat_id=current_gid)
+                title = chat_info.title or "Private Group"
+                status_text = f"\n📡 **Vault Status:** 🟢 Reachable (`{title}`)"
+            except Exception as e:
+                status_text = f"\n📡 **Vault Status:** ⚠️ Unreachable or Bot not Admin ({e})"
+
         await update.message.reply_text(
-            "📦 **Storage Vault Setup**\n\n"
-            "Create a private Telegram Group (e.g. *'My Media Vault'*), add this bot as Admin, and:\n"
-            "1. Either run `/setstorage` directly inside that group\n"
-            "2. Or send: `/setstorage -100xxxxxxxxxx` here"
+            f"📦 **Telegram Storage Vault Group**\n\n"
+            f"Current Vault ID: {current_display}{status_text}\n\n"
+            "💡 **How to change or set your Vault in Chat:**\n"
+            "• Send: `/setstorage <group_id>` (e.g. `/setstorage -5393269483` or `/setstorage -100xxxxxxxxxx`)\n"
+            "• Or forward any message from your storage group here and reply with `/setstorage`\n"
+            "• Or add the bot to your private group as Admin and type `/setstorage` inside that group\n\n"
+            "✨ _Tip: Type `/setstorage -5393269483` right now to update it directly!_",
+            parse_mode="Markdown"
         )
         return
 
-    ok = set_user_storage_group_id(uid, gid)
+    # Normalize ID: ensure standard leading hyphen if numeric
+    gid_clean = gid.strip().replace(" ", "")
+    if re.match(r"^\d+$", gid_clean):
+        gid_clean = f"-{gid_clean}"
+
+    ok = set_user_storage_group_id(uid, gid_clean)
     try:
         cfg = {}
         if os.path.exists(BOT_CONFIG_PATH):
             with open(BOT_CONFIG_PATH, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
-        cfg["storage_group_id"] = gid
+        cfg["storage_group_id"] = gid_clean
         with open(BOT_CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)
     except Exception:
         pass
 
     if ok:
+        # Verify connectivity & bot access immediately
+        test_note = ""
+        try:
+            chat = await context.bot.get_chat(chat_id=gid_clean)
+            c_title = chat.title or "Storage Vault"
+            test_note = f"\n\n🟢 **Verified:** Bot successfully reached **{c_title}**! Make sure the bot is an **Admin** with permission to send media/files."
+        except Exception as err:
+            test_note = (
+                f"\n\n⚠️ **Notice:** Group ID is saved, but the bot could not reach it yet (`{err}`).\n"
+                "👉 Please make sure you have added this bot into your group/channel and granted **Admin** rights!"
+            )
+
         await update.message.reply_text(
             f"✅ **Telegram Storage Vault Linked!**\n\n"
-            f"📦 **Storage Group ID:** `{gid}`\n"
-            f"All incoming media will now be backed up to your vault and assigned CDN streaming URLs."
+            f"📦 **Storage Group ID:** `{gid_clean}`\n"
+            f"All incoming media will be safely mirrored to this vault.{test_note}",
+            parse_mode="Markdown"
         )
     else:
         await update.message.reply_text("❌ Failed to save storage group ID.")
@@ -1747,6 +1792,8 @@ def main():
     app.add_handler(CommandHandler("resetpattern", cmd_resetpattern))
     app.add_handler(CommandHandler("setstorage", cmd_setstorage))
     app.add_handler(CommandHandler("setgroup", cmd_setstorage))
+    app.add_handler(CommandHandler("storage", cmd_storage))
+    app.add_handler(CommandHandler("getstorage", cmd_storage))
     app.add_handler(CommandHandler("setgemini", cmd_setgemini))
     app.add_handler(CommandHandler("setmtproto", cmd_setmtproto))
     app.add_handler(CommandHandler("setbuffer", cmd_setbuffer))
